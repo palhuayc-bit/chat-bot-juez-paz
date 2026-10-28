@@ -3,8 +3,12 @@ import csv
 import io
 import requests
 from fastapi import FastAPI, Request, Response
+from openai import OpenAI
 
 app = FastAPI(title="Chatbot ONAJUP - Justicia de Paz")
+
+# Inicialización del cliente de OpenAI
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Variables de entorno cargadas desde el servidor (Render)
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "onajup_2026")
@@ -26,19 +30,62 @@ def obtener_datos_sheets() -> list:
         return []
 
 
+def consultar_openai_estricto(pregunta_juez: str, datos_sheets: list) -> str:
+    """
+    Envía la consulta del Juez a OpenAI exigiendo estrictamente la norma legal
+    basada únicamente en la base de conocimientos de Google Sheets.
+    """
+    # Construir la base de conocimiento en texto plano a partir de Sheets
+    conocimiento = "BASE DE DATOS NORMATIVA OFICIAL DE ONAJUP:\n\n"
+    for row in datos_sheets:
+        conocimiento += f"Tema/Título: {row.get('Titulo_Boton', '')}\n"
+        conocimiento += f"Palabras Clave: {row.get('Descripcion_Corta', '')}\n"
+        conocimiento += f"Norma y Respuesta Oficial: {row.get('Respuesta_Texto', '')}\n"
+        conocimiento += "-" * 40 + "\n"
+
+    system_prompt = f"""
+    Eres el Asistente Legal Oficial de la ONAJUP (Poder Judicial del Perú). 
+    Tu función principal es ENTREGAR LA NORMA LEGAL EXACTA Y OFICIAL al Juez de Paz que realiza la consulta.
+
+    REGLAS DE CUMPLIMIENTO OBLIGATORIO Y ESTRICTO:
+    1. Toda respuesta DEBE fundamentarse e iniciar citando la BASE LEGAL O NORMA EXACTA (Ley N° 29824, Reglamento o Directivas) disponible en la base de datos.
+    2. Utiliza ÚNICAMENTE la información oficial provista a continuación:
+    {conocimiento}
+
+    3. Si la consulta del Juez no tiene una norma o procedimiento correspondiente dentro de la base provista, responde EXACTAMENTE:
+       "⚠️ No se encontró una norma o directiva específica en la base oficial para esta consulta. Por favor, remita su caso formalmente a la ONAJUP vía correo: onajup@pj.gob.pe."
+    
+    4. ESTÁ ESTRICTAMENTE PROHIBIDO:
+       - Inventar o inferir artículos, leyes, plazos o procedimientos no expuestos en la base.
+       - Emitir opiniones personales o jurídicas fuera del texto entregado.
+       - Responder sin mencionar la norma legal o procedimiento oficial.
+    """
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": pregunta_juez}
+            ],
+            temperature=0.0  # Temperatura 0 para cero creatividad y precisión estricta
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"Error consultando OpenAI: {e}")
+        return "⚠️ Ocurrió un error al consultar la base normativa. Intente nuevamente en unos minutos."
+
+
 def transcribir_audio_groq(media_id: str) -> str:
     """Descarga la nota de voz de Meta y la convierte a texto con Groq (Whisper)."""
     try:
-        # 1. Obtener URL del archivo desde Meta
         url_media = f"https://graph.facebook.com/v18.0/{media_id}"
         headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
         res_media = requests.get(url_media, headers=headers).json()
         download_url = res_media.get("url")
 
-        # 2. Descargar bytes del audio
         audio_bytes = requests.get(download_url, headers=headers).content
 
-        # 3. Transcribir con Whisper en Groq (Gratis)
         res_groq = requests.post(
             "https://api.groq.com/openai/v1/audio/transcriptions",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
@@ -77,12 +124,12 @@ async def receive_whatsapp(request: Request):
 
             # Caso A: El juez envió un mensaje de texto
             if msg_type == 'text':
-                texto_consulta = message['text']['body'].strip().lower()
+                texto_consulta = message['text']['body'].strip()
 
             # Caso B: El juez envió una nota de voz
             elif msg_type == 'audio':
                 media_id = message['audio']['id']
-                texto_consulta = transcribir_audio_groq(media_id).strip().lower()
+                texto_consulta = transcribir_audio_groq(media_id).strip()
 
             # Caso C: El juez seleccionó un botón/opción del menú interactivo
             elif msg_type == 'interactive':
@@ -92,20 +139,15 @@ async def receive_whatsapp(request: Request):
                         enviar_respuesta_con_boton_volver(from_number, row.get('Respuesta_Texto', ''))
                         return {"status": "ok"}
 
-            # Evaluar texto o voz transcrita
+            # Evaluar texto o nota de voz enviada por el juez
             if texto_consulta:
-                # Buscar coincidencia semántica/palabra clave en la hoja
-                respuesta_hallada = None
-                for row in datos_sheets:
-                    palabras_clave = [p.strip().lower() for p in row.get('Descripcion_Corta', '').split(',')]
-                    if any(kw in texto_consulta for kw in palabras_clave if len(kw) > 2):
-                        respuesta_hallada = row.get('Respuesta_Texto')
-                        break
-
-                if respuesta_hallada:
-                    enviar_respuesta_con_boton_volver(from_number, respuesta_hallada)
-                else:
+                # Si el usuario solo saluda o pide el menú
+                if texto_consulta.lower() in ["hola", "menu", "menú", "inicio", "opciones"]:
                     enviar_menu_lista(from_number, datos_sheets)
+                else:
+                    # Procesar consulta con OpenAI exigiendo entrega estricta de la norma
+                    respuesta_normativa = consultar_openai_estricto(texto_consulta, datos_sheets)
+                    enviar_respuesta_con_boton_volver(from_number, respuesta_normativa)
             else:
                 enviar_menu_lista(from_number, datos_sheets)
 
@@ -135,7 +177,7 @@ def enviar_menu_lista(to_number: str, datos_sheets: list):
         "interactive": {
             "type": "list",
             "header": {"type": "text", "text": "⚖️ ONAJUP - Justicia de Paz"},
-            "body": {"text": "Marque una de las siguientes opciones o envíe una nota de voz con su consulta:"},
+            "body": {"text": "Marque una opción o envíe una nota de voz/texto con su consulta:"},
             "footer": {"text": "Poder Judicial del Perú"},
             "action": {
                 "button": "Ver Opciones",
